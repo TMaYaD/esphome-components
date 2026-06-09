@@ -1,4 +1,5 @@
 #include "samsung_ac_ir.h"
+#include "samsung_ac_ir_switch.h"
 #include "esphome/core/log.h"
 #include <algorithm>
 
@@ -157,6 +158,15 @@ void SamsungAcClimate::apply_state_to_(IRSamsungAc &ac) const {
                         this->swing_mode == climate::CLIMATE_SWING_BOTH);
   ac.setSwing(swing_v);
   ac.setSwingH(swing_h);
+
+  // Aux toggle bits. The fan_special triplet (Powerful / Breeze / Econo) is
+  // internally mutex'd by the codec — we only ever set Powerful, so the
+  // other two stay cleared by stateReset() above and remain off on the wire.
+  ac.setPowerful(this->fast_);
+  ac.setQuiet(this->quiet_);
+  ac.setBeep(this->beep_);
+  ac.setClean(this->clean_);
+  ac.setDisplay(this->display_);
 }
 
 void SamsungAcClimate::load_state_from_(IRSamsungAc &ac) {
@@ -190,14 +200,28 @@ void SamsungAcClimate::load_state_from_(IRSamsungAc &ac) {
   else if (sv)         this->swing_mode = climate::CLIMATE_SWING_VERTICAL;
   else if (sh)         this->swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
   else                 this->swing_mode = climate::CLIMATE_SWING_OFF;
+
+  this->fast_    = ac.getPowerful();
+  this->quiet_   = ac.getQuiet();
+  this->display_ = ac.getDisplay();
+  // Deliberately NOT reading BeepToggle or CleanToggle10/11 back from
+  // decoded remote frames. Wire-level captures (see commit message)
+  // confirm:
+  //   - The remote sends BeepToggle=1 only on the Beep button press
+  //     itself (same frame for ON-direction and OFF-direction press),
+  //     and BeepToggle=0 on every other command (temp, mode, etc.).
+  //   - Same pulse pattern for CleanToggle10/11.
+  //   - The AC's stored beep/clean mode lives entirely in the AC and
+  //     is never echoed on the wire.
+  // If we trusted getBeep()/getClean() on RX, every non-aux remote press
+  // would flicker HA's switch to OFF — and the matching ON pulse from
+  // an Beep-press would mean we re-enter the "beep is on" state for
+  // ONE frame even when the user pressed Beep with intent to turn it
+  // OFF. There's no way to recover the AC's true mode over IR, so the
+  // honest model is: the switch tracks HA's intent for OUR TXs only.
 }
 
 void SamsungAcClimate::transmit_state_() {
-  if (this->transmitter_ == nullptr) {
-    ESP_LOGW(TAG, "No transmitter bound — skipping TX");
-    return;
-  }
-
   IRSamsungAc ac(kUnusedIRPin);
   this->apply_state_to_(ac);
   uint8_t *state = ac.getRaw();  // also computes the checksum nibbles
@@ -208,6 +232,55 @@ void SamsungAcClimate::transmit_state_() {
            "%02X %02X %02X %02X %02X %02X %02X",
            state[0], state[1], state[2], state[3], state[4], state[5], state[6],
            state[7], state[8], state[9], state[10], state[11], state[12], state[13]);
+
+  this->emit_raw_frame_(state);
+}
+
+void SamsungAcClimate::tap_button(SamsungAcButtonKind kind) {
+  IRSamsungAc ac(kUnusedIRPin);
+  this->apply_state_to_(ac);
+
+  // Override the cached aux bit so this one frame carries the toggle
+  // request regardless of switch state. apply_state_to_() already wrote
+  // the cached value; we just stomp on it.
+  const char *kind_str = "?";
+  switch (kind) {
+    case BeepTap:  ac.setBeep(true);  kind_str = "beep";  break;
+    case CleanTap: ac.setClean(true); kind_str = "clean"; break;
+  }
+
+  uint8_t *state = ac.getRaw();  // first checksum pass (byte 2 hi nibble = 0)
+
+  // Set the "remote-issued" watermark bit at byte 2 high nibble, bit 4
+  // (mask 0x10). Empirically verified — without this bit, the frame only
+  // drives per-command audible; with it, the AC interprets the matching
+  // Toggle bit as a stored-mode toggle, exactly mirroring a physical
+  // remote button press. The struct in ir_Samsung.h marks this nibble as
+  // anonymous padding so we can't address it through bit-fields; patching
+  // the raw byte is the only path.
+  state[2] |= 0x10;
+
+  // checksum() only writes byte 2's LOW nibble (Sum1Upper), so the bit we
+  // just set survives the recompute. Re-run getRaw() to refresh the
+  // section-1 checksum to match the modified byte 2.
+  ac.getRaw();
+
+  ESP_LOGD(TAG,
+           "TX SAMSUNG_AC %s-toggle: "
+           "%02X %02X %02X %02X %02X %02X %02X "
+           "%02X %02X %02X %02X %02X %02X %02X",
+           kind_str,
+           state[0], state[1], state[2], state[3], state[4], state[5], state[6],
+           state[7], state[8], state[9], state[10], state[11], state[12], state[13]);
+
+  this->emit_raw_frame_(state);
+}
+
+void SamsungAcClimate::emit_raw_frame_(const uint8_t *state) {
+  if (this->transmitter_ == nullptr) {
+    ESP_LOGW(TAG, "No transmitter bound — skipping TX");
+    return;
+  }
 
   auto call = this->transmitter_->transmit();
   auto *data = call.get_data();
@@ -293,7 +366,70 @@ bool SamsungAcClimate::on_receive(remote_base::RemoteReceiveData data) {
   ac.setRaw(state);
   this->load_state_from_(ac);
   this->publish_state();
+  this->publish_all_aux_flags_();
   return true;
+}
+
+void SamsungAcClimate::register_switch(SamsungAcSwitch *sw,
+                                       SamsungAcSwitchKind kind) {
+  switch (kind) {
+    case Fast:    this->fast_switch_    = sw; break;
+    case Quiet:   this->quiet_switch_   = sw; break;
+    case Beep:    this->beep_switch_    = sw; break;
+    case Clean:   this->clean_switch_   = sw; break;
+    case Display: this->display_switch_ = sw; break;
+  }
+}
+
+bool SamsungAcClimate::flag_value_(SamsungAcSwitchKind kind) const {
+  switch (kind) {
+    case Fast:    return this->fast_;
+    case Quiet:   return this->quiet_;
+    case Beep:    return this->beep_;
+    case Clean:   return this->clean_;
+    case Display: return this->display_;
+  }
+  return false;
+}
+
+void SamsungAcClimate::set_flag(SamsungAcSwitchKind kind, bool state) {
+  switch (kind) {
+    case Fast:    this->fast_    = state; break;
+    case Quiet:   this->quiet_   = state; break;
+    case Beep:    this->beep_    = state; break;
+    case Clean:   this->clean_   = state; break;
+    case Display: this->display_ = state; break;
+  }
+  // Echo onto the wire, then publish ALL aux states back. We do NOT call
+  // publish_state() on the climate — none of its tracked fields moved, and
+  // an unprompted climate publish causes HA churn. We publish all five aux
+  // entities (not just the touched one) so any future addition of Breeze /
+  // Econo to the user-facing surface stays correct under the codec's
+  // fan_special mutex.
+  this->transmit_state_();
+  this->publish_all_aux_flags_();
+}
+
+void SamsungAcClimate::publish_flag_(SamsungAcSwitchKind kind) {
+  SamsungAcSwitch *sw = nullptr;
+  switch (kind) {
+    case Fast:    sw = this->fast_switch_;    break;
+    case Quiet:   sw = this->quiet_switch_;   break;
+    case Beep:    sw = this->beep_switch_;    break;
+    case Clean:   sw = this->clean_switch_;   break;
+    case Display: sw = this->display_switch_; break;
+  }
+  if (sw != nullptr) {
+    sw->publish_state(this->flag_value_(kind));
+  }
+}
+
+void SamsungAcClimate::publish_all_aux_flags_() {
+  this->publish_flag_(Fast);
+  this->publish_flag_(Quiet);
+  this->publish_flag_(Beep);
+  this->publish_flag_(Clean);
+  this->publish_flag_(Display);
 }
 
 }  // namespace samsung_ac_ir
