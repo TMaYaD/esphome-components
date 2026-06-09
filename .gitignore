@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ESPHome build artifacts (in case someone runs `esphome compile` here)
+.esphome/
