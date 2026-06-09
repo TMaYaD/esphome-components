@@ -18,19 +18,15 @@ receives every signal and decides independently whether to obey.
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import climate, remote_transmitter, remote_receiver
-from esphome.const import CONF_ID
 from esphome.core import CORE
+
+from . import VoltasClimate
 
 DEPENDENCIES = ["remote_transmitter"]
 AUTO_LOAD = ["remote_receiver"]
 
 CONF_TRANSMITTER_ID = "transmitter_id"
 CONF_RECEIVER_ID = "receiver_id"
-
-voltas_ac_ns = cg.esphome_ns.namespace("voltas_ac")
-VoltasClimate = voltas_ac_ns.class_(
-    "VoltasClimate", climate.Climate, cg.Component
-)
 
 # climate.climate_schema() (ESPHome 2024.x+) already includes GenerateID for us.
 CONFIG_SCHEMA = climate.climate_schema(VoltasClimate).extend(

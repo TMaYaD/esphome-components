@@ -1,4 +1,5 @@
 #include "voltas_ac.h"
+#include "voltas_ac_switch.h"
 #include "esphome/core/log.h"
 #include <algorithm>
 
@@ -102,6 +103,59 @@ void VoltasClimate::control(const climate::ClimateCall &call) {
   this->publish_state();
 }
 
+void VoltasClimate::register_switch(VoltasSwitch *sw, VoltasSwitchKind kind) {
+  switch (kind) {
+    case SLEEP: this->sleep_switch_ = sw; break;
+    case TURBO: this->turbo_switch_ = sw; break;
+    case ECONO: this->econo_switch_ = sw; break;
+    case LIGHT: this->light_switch_ = sw; break;
+  }
+}
+
+bool VoltasClimate::flag_value_(VoltasSwitchKind kind) const {
+  switch (kind) {
+    case SLEEP: return this->sleep_;
+    case TURBO: return this->turbo_;
+    case ECONO: return this->econo_;
+    case LIGHT: return this->light_;
+  }
+  return false;
+}
+
+void VoltasClimate::set_flag(VoltasSwitchKind kind, bool state) {
+  switch (kind) {
+    case SLEEP: this->sleep_ = state; break;
+    case TURBO: this->turbo_ = state; break;
+    case ECONO: this->econo_ = state; break;
+    case LIGHT: this->light_ = state; break;
+  }
+  // Echo the change onto the wire and confirm to the switch entity. We
+  // do NOT call publish_state() on the climate — none of its tracked
+  // fields moved, and an unprompted climate publish triggers HA churn.
+  this->transmit_state_();
+  this->publish_flag_(kind);
+}
+
+void VoltasClimate::publish_flag_(VoltasSwitchKind kind) {
+  VoltasSwitch *sw = nullptr;
+  switch (kind) {
+    case SLEEP: sw = this->sleep_switch_; break;
+    case TURBO: sw = this->turbo_switch_; break;
+    case ECONO: sw = this->econo_switch_; break;
+    case LIGHT: sw = this->light_switch_; break;
+  }
+  if (sw != nullptr) {
+    sw->publish_state(this->flag_value_(kind));
+  }
+}
+
+void VoltasClimate::publish_all_flags_() {
+  this->publish_flag_(SLEEP);
+  this->publish_flag_(TURBO);
+  this->publish_flag_(ECONO);
+  this->publish_flag_(LIGHT);
+}
+
 void VoltasClimate::apply_state_to_(IRVoltas &ac) const {
   ac.stateReset();
   ac.setModel(kVoltas122LZF);
@@ -138,6 +192,13 @@ void VoltasClimate::apply_state_to_(IRVoltas &ac) const {
   ac.setFan(v_fan);
 
   ac.setSwingV(this->swing_mode == climate::CLIMATE_SWING_VERTICAL);
+
+  // Independent toggle bits. The wire protocol allows any combination;
+  // we just mirror our cache verbatim.
+  ac.setSleep(this->sleep_);
+  ac.setTurbo(this->turbo_);
+  ac.setEcono(this->econo_);
+  ac.setLight(this->light_);
 }
 
 void VoltasClimate::load_state_from_(IRVoltas &ac) {
@@ -164,6 +225,11 @@ void VoltasClimate::load_state_from_(IRVoltas &ac) {
 
   this->swing_mode = ac.getSwingV() ? climate::CLIMATE_SWING_VERTICAL
                                     : climate::CLIMATE_SWING_OFF;
+
+  this->sleep_ = ac.getSleep();
+  this->turbo_ = ac.getTurbo();
+  this->econo_ = ac.getEcono();
+  this->light_ = ac.getLight();
 }
 
 void VoltasClimate::transmit_state_() {
@@ -240,6 +306,7 @@ bool VoltasClimate::on_receive(remote_base::RemoteReceiveData data) {
   ac.setRaw(state);
   this->load_state_from_(ac);
   this->publish_state();
+  this->publish_all_flags_();
   return true;
 }
 

@@ -23,7 +23,7 @@ external_components:
 
 | Name | Platform | Hardware | Status |
 |---|---|---|---|
-| [`voltas_ac`](components/voltas_ac/) | `climate` | Voltas A/C, 122LZF protocol family | Stable. Two-way sync (TX + RX) validated on the AC-133B remote |
+| [`voltas_ac`](components/voltas_ac/) | `climate`, `switch` | Voltas A/C, 122LZF protocol family | Stable. Two-way sync (TX + RX) validated on the AC-133B remote |
 
 ### `voltas_ac`
 
@@ -63,7 +63,33 @@ climate:
 
 Supported climate traits: modes (Off / Cool / Dry / Fan-Only), target temp (16–30 °C step 1 °C), fan (Auto / Low / Medium / High), swing (Off / Vertical).
 
-> **Local web UI limitation.** ESPHome's `web_server` (both v2 and v3, as of 2026.5.2) renders only mode and target temperature for climate entities — fan and swing aren't in the JS bundle. The native API serves them correctly, so Home Assistant shows the full set. For local fan/swing control without HA, add template `select:` entities mirroring the climate's `fan_mode` / `swing_mode`.
+#### Auxiliary toggles (Sleep / Turbo / Saver / Lamp)
+
+The 122LZF protocol carries four independent flag bits beyond the core climate state. They're exposed as a sibling `switch` platform parented to the climate id. Wire-protocol-faithful: combinations are allowed (the Voltas firmware itself sometimes auto-couples Sleep with Saver), so we don't collapse them onto a mutually-exclusive `climate.preset`.
+
+```yaml
+switch:
+  - platform: voltas_ac
+    name: Master AC Sleep
+    climate_id: master_ac
+    type: sleep
+  - platform: voltas_ac
+    name: Master AC Turbo
+    climate_id: master_ac
+    type: turbo
+  - platform: voltas_ac
+    name: Master AC Saver
+    climate_id: master_ac
+    type: saver
+  - platform: voltas_ac
+    name: Master AC Lamp
+    climate_id: master_ac
+    type: lamp
+```
+
+`type:` accepts `sleep`, `turbo`, `saver` (a.k.a. Econo on the wire), `lamp` (a.k.a. Light). Toggling any one emits a full Voltas frame with the climate's current mode/temp/fan/swing plus the modified flag. Incoming frames update all four switches in lock-step with the climate. Each switch is optional — opt in only to the toggles you want surfaced.
+
+> **Local web UI limitation.** ESPHome's `web_server` (both v2 and v3, as of 2026.5.2) renders only mode and target temperature for climate entities — fan and swing aren't in the JS bundle. The native API serves them correctly, so Home Assistant shows the full set. For local fan/swing control without HA, add template `select:` entities mirroring the climate's `fan_mode` / `swing_mode`. The auxiliary switches above are regular `switch` entities and render fine in `web_server`.
 
 ## License
 
