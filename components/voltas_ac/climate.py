@@ -27,6 +27,13 @@ AUTO_LOAD = ["remote_receiver"]
 
 CONF_TRANSMITTER_ID = "transmitter_id"
 CONF_RECEIVER_ID = "receiver_id"
+# Opt-in: some Voltas remotes/units in the 122LZF timing family carry a
+# horizontal-swing command in byte 0 (SwingHChange marker + direction
+# bit) — upstream IRVoltas actually fingerprints those as a *different*
+# model and no-ops setSwingH() for 122LZF. Verified live on the guest
+# unit; the master's AC-133B never moves byte 0. Off by default so
+# existing devices keep byte 0 at the 0x33 no-change signature.
+CONF_HORIZONTAL_SWING = "horizontal_swing"
 
 # climate.climate_schema() (ESPHome 2024.x+) already includes GenerateID for us.
 CONFIG_SCHEMA = climate.climate_schema(VoltasClimate).extend(
@@ -37,6 +44,7 @@ CONFIG_SCHEMA = climate.climate_schema(VoltasClimate).extend(
         cv.Optional(CONF_RECEIVER_ID): cv.use_id(
             remote_receiver.RemoteReceiverComponent
         ),
+        cv.Optional(CONF_HORIZONTAL_SWING, default=False): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -51,6 +59,9 @@ async def to_code(config):
     if CONF_RECEIVER_ID in config:
         rx = await cg.get_variable(config[CONF_RECEIVER_ID])
         cg.add(var.set_receiver(rx))
+
+    if config[CONF_HORIZONTAL_SWING]:
+        cg.add(var.set_horizontal_swing(True))
 
     # Pull in IRremoteESP8266 for the Voltas codec. We use IRVoltas for
     # state field manipulation + checksum only; TX and RX timings travel

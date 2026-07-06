@@ -62,7 +62,23 @@ climate:
     receiver_id: ir_rx
 ```
 
-Supported climate traits: modes (Off / Cool / Dry / Fan-Only), target temp (16–30 °C step 1 °C), fan (Auto / Low / Medium / High), swing (Off / Vertical).
+Supported climate traits: modes (Off / Cool / Dry / Fan-Only), target temp (16–30 °C step 1 °C), fan (Auto / Low / Medium / High), swing (Off / Vertical — plus Horizontal / Both with `horizontal_swing: true`).
+
+#### Horizontal swing (opt-in)
+
+Some remotes in the 122LZF timing family carry a horizontal-swing command in byte 0: a `SwingHChange` marker (`0b1111100`) plus a direction bit, where steady frames always show the `0x33` "no change" signature. Upstream `IRVoltas` actually fingerprints marker-bearing remotes as a *different model* and no-ops `setSwingH()` for 122LZF — so this component patches byte 0 raw (and re-checksums) when an H change is pending, and emits the marker only on actual changes, mirroring the physical remote.
+
+```yaml
+climate:
+  - platform: voltas_ac
+    name: Guest AC
+    id: guest_ac
+    transmitter_id: ir_tx
+    receiver_id: ir_rx
+    horizontal_swing: true   # default false
+```
+
+Off by default: units like the master's AC-133B never move byte 0, and enabling H on them would emit frames the AC may not understand. Verified live on the guest unit (captures `0xF8`/`0xF9` in byte 0 = H off/on commands). Note the wire only reports H state on explicit H-command frames — steady frames carry no H info, so the component caches the last commanded/observed value.
 
 #### Auxiliary toggles (Sleep / Turbo / Saver / Lamp)
 

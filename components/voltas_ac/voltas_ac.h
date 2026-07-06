@@ -39,6 +39,9 @@ class VoltasClimate : public climate::Climate,
   void set_receiver(remote_receiver::RemoteReceiverComponent *r) {
     this->receiver_ = r;
   }
+  void set_horizontal_swing(bool enabled) {
+    this->horizontal_swing_ = enabled;
+  }
 
   climate::ClimateTraits traits() override;
   void control(const climate::ClimateCall &call) override;
@@ -88,6 +91,15 @@ class VoltasClimate : public climate::Climate,
   // millis() at the end of our last TX. Used to self-suppress RX of our
   // own emission (the receiver in the same room WILL hear it).
   uint32_t last_tx_ms_{0};
+
+  // Horizontal swing (opt-in; see climate.py). The wire carries H state
+  // only on explicit H-command frames (byte 0 = SwingHChange marker +
+  // direction bit); steady frames say "no change". So we cache the last
+  // commanded/observed H state and only emit the marker when it moves —
+  // mirroring how the physical remote behaves.
+  bool horizontal_swing_{false};
+  bool swing_h_{false};
+  bool swing_h_change_pending_{false};
 
   // Cached Voltas-protocol toggle bits. Source of truth for both TX
   // encoding and switch-entity state. Updated by both control() paths and

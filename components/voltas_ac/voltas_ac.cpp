@@ -80,12 +80,23 @@ climate::ClimateTraits VoltasClimate::traits() {
       climate::CLIMATE_FAN_MEDIUM,
       climate::CLIMATE_FAN_HIGH,
   });
-  // Model 1 (122LZF) supports vertical swing only; the enum's comment
-  // explicitly says "No SwingH support".
-  traits.set_supported_swing_modes({
-      climate::CLIMATE_SWING_OFF,
-      climate::CLIMATE_SWING_VERTICAL,
-  });
+  // The 122LZF timing family splits here: the master's AC-133B remote
+  // never touches byte 0 (vertical only), but some sibling remotes carry
+  // a horizontal-swing command there. Surface H/BOTH only when the device
+  // config opts in — see horizontal_swing in climate.py.
+  if (this->horizontal_swing_) {
+    traits.set_supported_swing_modes({
+        climate::CLIMATE_SWING_OFF,
+        climate::CLIMATE_SWING_VERTICAL,
+        climate::CLIMATE_SWING_HORIZONTAL,
+        climate::CLIMATE_SWING_BOTH,
+    });
+  } else {
+    traits.set_supported_swing_modes({
+        climate::CLIMATE_SWING_OFF,
+        climate::CLIMATE_SWING_VERTICAL,
+    });
+  }
   return traits;
 }
 
@@ -96,8 +107,22 @@ void VoltasClimate::control(const climate::ClimateCall &call) {
     this->target_temperature = *call.get_target_temperature();
   if (call.get_fan_mode().has_value())
     this->fan_mode = *call.get_fan_mode();
-  if (call.get_swing_mode().has_value())
-    this->swing_mode = *call.get_swing_mode();
+  if (call.get_swing_mode().has_value()) {
+    auto sm = *call.get_swing_mode();
+    if (!this->horizontal_swing_ &&
+        (sm == climate::CLIMATE_SWING_HORIZONTAL ||
+         sm == climate::CLIMATE_SWING_BOTH)) {
+      // Shouldn't be reachable (traits don't offer these), but stay safe.
+      sm = climate::CLIMATE_SWING_VERTICAL;
+    }
+    const bool want_h = (sm == climate::CLIMATE_SWING_HORIZONTAL ||
+                         sm == climate::CLIMATE_SWING_BOTH);
+    if (this->horizontal_swing_ && want_h != this->swing_h_) {
+      this->swing_h_ = want_h;
+      this->swing_h_change_pending_ = true;
+    }
+    this->swing_mode = sm;
+  }
 
   this->transmit_state_();
   this->publish_state();
@@ -191,7 +216,8 @@ void VoltasClimate::apply_state_to_(IRVoltas &ac) const {
   }
   ac.setFan(v_fan);
 
-  ac.setSwingV(this->swing_mode == climate::CLIMATE_SWING_VERTICAL);
+  ac.setSwingV(this->swing_mode == climate::CLIMATE_SWING_VERTICAL ||
+               this->swing_mode == climate::CLIMATE_SWING_BOTH);
 
   // Independent toggle bits. The wire protocol allows any combination;
   // we just mirror our cache verbatim.
@@ -223,8 +249,18 @@ void VoltasClimate::load_state_from_(IRVoltas &ac) {
     default:             this->fan_mode = climate::CLIMATE_FAN_AUTO;   break;
   }
 
-  this->swing_mode = ac.getSwingV() ? climate::CLIMATE_SWING_VERTICAL
-                                    : climate::CLIMATE_SWING_OFF;
+  const bool sv = ac.getSwingV();
+  if (this->horizontal_swing_) {
+    // H state arrives only on explicit H-command frames; on_receive()
+    // refreshes swing_h_ before calling us. Steady frames keep the cache.
+    if (sv && this->swing_h_)      this->swing_mode = climate::CLIMATE_SWING_BOTH;
+    else if (sv)                   this->swing_mode = climate::CLIMATE_SWING_VERTICAL;
+    else if (this->swing_h_)       this->swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
+    else                           this->swing_mode = climate::CLIMATE_SWING_OFF;
+  } else {
+    this->swing_mode = sv ? climate::CLIMATE_SWING_VERTICAL
+                          : climate::CLIMATE_SWING_OFF;
+  }
 
   this->sleep_ = ac.getSleep();
   this->turbo_ = ac.getTurbo();
@@ -241,6 +277,19 @@ void VoltasClimate::transmit_state_() {
   IRVoltas ac(kUnusedIRPin);
   this->apply_state_to_(ac);
   uint8_t *state = ac.getRaw();  // also computes the checksum byte
+
+  // Horizontal-swing command. IRVoltas gates setSwingH() to a no-op for
+  // the 122LZF model we pin, so the byte-0 patch goes in raw: the
+  // SwingHChange marker (0b1111100, captured as 0xF8/0xF9 on the guest
+  // remote) plus the direction bit. Emitted only when H state actually
+  // changes — steady frames keep the 0x33 no-change signature, mirroring
+  // the physical remote. Re-run getRaw() to refresh the checksum.
+  if (this->horizontal_swing_ && this->swing_h_change_pending_) {
+    state[0] = static_cast<uint8_t>((0b1111100u << 1) |
+                                    (this->swing_h_ ? 1u : 0u));
+    ac.getRaw();
+    this->swing_h_change_pending_ = false;
+  }
 
   ESP_LOGD(TAG,
            "TX Voltas frame: "
@@ -304,6 +353,13 @@ bool VoltasClimate::on_receive(remote_base::RemoteReceiveData data) {
 
   IRVoltas ac(kUnusedIRPin);
   ac.setRaw(state);
+  // Byte 0 carries H-swing state only when the change marker is present
+  // (0x33 = no-change signature on every steady frame). getSwingH() is
+  // model-gated off for 122LZF, so read the wire byte directly.
+  if (this->horizontal_swing_ &&
+      (state[0] >> 1) == 0b1111100) {
+    this->swing_h_ = (state[0] & 0x01) != 0;
+  }
   this->load_state_from_(ac);
   this->publish_state();
   this->publish_all_flags_();
