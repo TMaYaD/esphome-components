@@ -25,6 +25,7 @@ external_components:
 |---|---|---|---|
 | [`voltas_ac`](components/voltas_ac/) | `climate`, `switch` | Voltas A/C, 122LZF protocol family | Stable. Two-way sync (TX + RX) validated on the AC-133B remote |
 | [`samsung_ac_ir`](components/samsung_ac_ir/) | `climate`, `switch`, `button` | Samsung A/C, SAMSUNG_AC 14-byte IR family (post-2018, non-WindFree) | Climate + five aux switches (Fast / Quiet / Beep / Clean / Display) + two stored-mode toggle buttons (Beep / Clean). 21-byte timer frame and remote's trigger / Capacity buttons deferred |
+| [`midea_ac_ir`](components/midea_ac_ir/) | `climate`, `switch`, `button` | Midea A/C, Coolix 24-bit + Coolix48, RG51-remote generation | Protocol mapped & TX-verified live against an RG51Y5/E unit. Timers (Coolix48) deferred |
 
 ### `voltas_ac`
 
@@ -197,6 +198,50 @@ Both are optional and independent.
 **Deferred.** The remote's trigger-style buttons (Usage, Filter reset) and the 5-step Capacity cycle (40 / 60 / 80 / 100 / 120 %) aren't in `IRSamsungAc`'s public API — they need Tasmota-dump bit reverse-engineering to wire up. The 21-byte extended SAMSUNG_AC frame (on/off/sleep timers, explicit power-change packets) is also a separate pass.
 
 > The same `web_server` climate rendering limitation noted above applies here too. The aux switches and buttons are regular `switch` / `button` entities and render fine in `web_server`.
+
+### `midea_ac_ir`
+
+Native ESPHome climate platform for Midea split A/C units of the RG51-remote generation, speaking the 24-bit **Coolix** protocol plus the 48-bit **Coolix48** extension. Verified frame-by-frame against an RG51Y5/E remote and its unit; the target hardware proved byte-exact reference Coolix throughout.
+
+Unlike the other components here, `midea_ac_ir` has **no IRremoteESP8266 dependency** — the Coolix word is 3 bytes with byte-inverse framing and no checksum, the full field map was verified empirically, and the library's stateful `IRac`/`IRCoolixAC` layer is where the fan-mode encoding bug lived that shipped broken frames from the Tasmota firmware this replaces (fixed upstream later; see the ordering comment in `IRac::coolix`). All TX/RX flows through ESPHome's `remote_base`, same as its siblings.
+
+```yaml
+climate:
+  - platform: midea_ac_ir
+    name: Living AC
+    id: living_ac
+    transmitter_id: ir_tx
+    receiver_id: ir_rx
+
+switch:
+  - platform: midea_ac_ir
+    name: Living AC Eco
+    climate_id: living_ac
+    type: eco
+
+button:
+  - platform: midea_ac_ir
+    name: Living AC Direct
+    climate_id: living_ac
+    type: direct   # also: sleep, turbo, led, clean
+```
+
+Supported climate traits: modes (Off / Cool / Dry / Fan-Only / Auto), target temp (17–30 °C step 1 °C), fan (Auto / Low / Medium / High). Heat exists in the wire protocol but cool-only units don't even ACK it (verified — no beep), so it isn't exposed.
+
+Entity model, driven by what's actually observable over IR:
+
+- **`switch` — `eco`.** The one aux feature with distinct on/off words (Coolix48 `0xB54AF50A8240` / `...8340`): settable in both directions and RX-synced when the physical remote is used.
+- **`button` — `direct`, `sleep`, `turbo`, `led`, `clean`.** Blind toggles: the AC keeps the resulting mode internally and never echoes it, so stateless buttons are the honest surface. `direct` steps the 7-position vane one notch (no absolute positioning exists) and is sent as a **single** Coolix block — doubled, it would step twice. `clean` starts the self-clean cycle (panel shows "SC").
+- **No swing climate trait** — vane control is step-only on the wire.
+
+Protocol quirks worth knowing:
+
+- Commands must be sent as **two identical blocks** (except `direct`): the unit beeps at single-block sends but does not commit them.
+- There is **no power bit** in the state word. Power-on = any state frame; power-off = discrete word `0xB27BE0`. After an off, the unit ignores wake-up frames for a while (observed: ignored at 8 s, accepted at 120 s — likely compressor lockout). Rapid off→on automations should expect to retry.
+- The `remote_receiver` needs `idle` well above Coolix's 5.2 ms block gap (the YTF bridge package uses 25 ms) or frames arrive split.
+- Timer buttons (likely Coolix48, per upstream notes) are deferred pending captures.
+
+> The `web_server` climate rendering limitation above applies here too.
 
 ## License
 
